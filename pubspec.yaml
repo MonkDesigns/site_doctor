@@ -1,0 +1,14 @@
+name: site_doctor
+description: Fine-grained website diagnostics (DNS, TCP, TLS cert, HTTP/HTTPS GET).
+publish_to: "none"
+version: 1.0.0
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
