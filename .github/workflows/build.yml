@@ -47,6 +47,10 @@ jobs:
           git clone -q -b stable --depth 1 https://github.com/flutter/flutter.git $HOME/flutter
           echo "$HOME/flutter/bin" >> $GITHUB_PATH
       - run: flutter create . --platforms=android --project-name site_doctor
+      # Release builds need INTERNET declared explicitly (debug gets it free).
+      - run: |
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' android/app/src/main/AndroidManifest.xml
+          grep -n "INTERNET" android/app/src/main/AndroidManifest.xml
       - run: flutter build apk --release   # APK bundles arm32+arm64+x64
       - uses: actions/upload-artifact@v4
         with:
