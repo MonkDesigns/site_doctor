@@ -19,12 +19,13 @@
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 
 // Overridden by CI with the git tag: --dart-define=APP_VERSION=v1.1.0
 const String appVersion =
-    String.fromEnvironment('APP_VERSION', defaultValue: 'v1.1.0-dev');
+    String.fromEnvironment('APP_VERSION', defaultValue: 'v1.1.1-dev');
 
 void main() => runApp(const SiteDoctorApp());
 
@@ -360,10 +361,13 @@ class Diagnostics {
 
   // -- 5 & 6. Full HTTP / HTTPS GET -------------------------------------------
   //
-  // When targeting a specific server, the connection is dialed to that IP
-  // while the request URI keeps the domain name — so SNI, certificate
-  // matching, the Host header, and redirects all behave exactly as a
-  // browser reaching that particular server (curl --resolve equivalent).
+  // Hand-rolled HTTP/1.1 over dart:io sockets so the dial target is fully
+  // controlled: per-server suites dial that IP while SNI and the Host
+  // header carry the domain name (curl --resolve equivalent). Suite 0
+  // dials the host name and lets the OS route. Every suite uses this same
+  // code path, so results are directly comparable.
+  // (Dart's HttpClient connectionFactory does NOT TLS-wrap supplied
+  // sockets — learned the hard way in v1.1.0.)
 
   Future<void> _testHttpGet(TestSuite s, {required bool secure}) async {
     final step = secure ? s.httpsGet : s.httpGet;
@@ -374,96 +378,169 @@ class Diagnostics {
       return;
     }
 
-    final client = HttpClient()
-      ..connectionTimeout = _timeout
-      ..userAgent = 'SiteDoctor/1.1';
-    bool badCertAccepted = false;
-    client.badCertificateCallback = (c, h, p) {
-      badCertAccepted = true;
-      return true;
-    };
-    if (s.targetIp != null) {
-      final ip = s.targetIp!;
-      client.connectionFactory = (uri, proxyHost, proxyPort) {
-        // Dial the chosen server regardless of what the URI's host
-        // resolves to. TLS (with SNI = uri.host) is layered on top by
-        // HttpClient for https URIs.
-        return Socket.startConnect(ip, uri.port);
-      };
-      step.log('Connections pinned to ${s.targetIp}.');
-    }
+    var curSecure = secure;
+    var curHost = host;
+    var curPath = pathAndQuery;
+    int? curPort; // null = scheme default
+    var hops = 0;
+    var badCert = false;
 
-    final parsed = Uri.parse('http://x$pathAndQuery');
-    final uri = Uri(
-      scheme: secure ? 'https' : 'http',
-      host: host,
-      path: parsed.path,
-      query: parsed.query.isEmpty ? null : parsed.query,
-    );
-
-    try {
-      final req = await client.getUrl(uri).timeout(_timeout);
-      req.followRedirects = true;
-      req.maxRedirects = 5;
-      final resp = await req.close().timeout(_timeout);
-
-      for (final r in resp.redirects) {
-        step.log('Redirect ${r.statusCode} → ${r.location}');
+    while (true) {
+      final port = curPort ?? (curSecure ? 443 : 80);
+      final dial = s.targetIp ?? curHost;
+      Socket? raw;
+      final Socket io;
+      try {
+        raw = await Socket.connect(dial, port, timeout: _timeout);
+        if (curSecure) {
+          io = await SecureSocket.secure(raw, host: curHost,
+              onBadCertificate: (_) {
+            badCert = true;
+            return true;
+          }).timeout(_timeout);
+        } else {
+          io = raw;
+        }
+      } on HandshakeException catch (e) {
+        raw?.destroy();
+        step.status = StepStatus.failed;
+        step.summary = 'TLS handshake failed — no page returned.';
+        step.log('HandshakeException: ${e.message}');
+        return;
+      } on SocketException catch (e) {
+        step.status = StepStatus.failed;
+        step.summary = 'Connection failed — no page returned.';
+        step.log('SocketException: ${e.message}');
+        return;
+      } on TimeoutException {
+        raw?.destroy();
+        step.status = StepStatus.failed;
+        step.summary = 'No response within ${_timeout.inSeconds}s.';
+        return;
       }
 
-      int bytes = 0;
-      await for (final chunk in resp.timeout(_timeout)) {
-        bytes += chunk.length;
+      step.log('${curSecure ? 'https' : 'http'}://$curHost$curPath '
+          '→ dialed ${io.remoteAddress.address}:$port'
+          '${curSecure ? ' (SNI: $curHost)' : ''}');
+
+      io.write('GET $curPath HTTP/1.1\r\n'
+          'Host: $curHost\r\n'
+          'User-Agent: SiteDoctor/1.1\r\n'
+          'Accept: */*\r\n'
+          'Connection: close\r\n\r\n');
+      await io.flush();
+
+      final buf = BytesBuilder(copy: false);
+      var stalled = false;
+      await for (final chunk in io.timeout(_timeout, onTimeout: (sink) {
+        stalled = true;
+        sink.close();
+      })) {
+        buf.add(chunk);
+      }
+      io.destroy();
+
+      final data = buf.takeBytes();
+      final headerEnd = _indexOfDoubleCrlf(data);
+      if (headerEnd < 0) {
+        step.status = StepStatus.failed;
+        step.summary = stalled
+            ? 'Server stalled before completing response headers.'
+            : 'Connection closed before response headers completed.';
+        step.log('Received ${data.length} raw byte(s).');
+        return;
       }
 
-      final server = resp.headers.value(HttpHeaders.serverHeader);
-      final ctype = resp.headers.contentType?.toString();
-      step.log('Status : ${resp.statusCode} ${resp.reasonPhrase}');
+      final head = String.fromCharCodes(data.sublist(0, headerEnd));
+      final lines = head.split('\r\n');
+      final m =
+          RegExp(r'^HTTP/\d\.\d\s+(\d{3})\s*(.*)').firstMatch(lines.first);
+      if (m == null) {
+        step.status = StepStatus.failed;
+        step.summary = 'Malformed status line from server.';
+        step.log('First line: ${lines.first}');
+        return;
+      }
+      final code = int.parse(m.group(1)!);
+      final reason = m.group(2) ?? '';
+      final headers = <String, String>{};
+      for (final l in lines.skip(1)) {
+        final i = l.indexOf(':');
+        if (i > 0) {
+          headers[l.substring(0, i).trim().toLowerCase()] =
+              l.substring(i + 1).trim();
+        }
+      }
+      final bodyBytes = data.length - headerEnd - 4;
+
+      final loc = headers['location'];
+      if (code >= 300 && code < 400 && loc != null) {
+        step.log('Redirect $code → $loc');
+        if (++hops > 5) {
+          step.status = StepStatus.failed;
+          step.summary = 'Too many redirects (>5).';
+          return;
+        }
+        final base = Uri(
+            scheme: curSecure ? 'https' : 'http',
+            host: curHost,
+            port: port,
+            path: curPath);
+        final next = base.resolve(loc);
+        if (next.host != curHost && s.targetIp != null) {
+          step.log('(host changed to ${next.host}; connection still '
+              'pinned to ${s.targetIp})');
+        }
+        curSecure = next.scheme == 'https';
+        curHost = next.host;
+        curPort = next.hasPort ? next.port : null;
+        curPath = next.path.isEmpty ? '/' : next.path;
+        if (next.hasQuery) curPath = '$curPath?${next.query}';
+        continue;
+      }
+
+      final server = headers['server'];
+      final ctype = headers['content-type'];
+      final tenc = headers['transfer-encoding'];
+      step.log('Status : $code $reason');
       if (server != null) step.log('Server : $server');
       if (ctype != null) step.log('Content-Type : $ctype');
-      step.log('Body : $bytes bytes received');
-      if (badCertAccepted) {
+      step.log('Body : $bodyBytes bytes received'
+          '${tenc == null ? '' : ' (transfer-encoding: $tenc, raw count)'}');
+      if (stalled) {
+        step.log('Note: server did not close the connection; read ended '
+            'by ${_timeout.inSeconds}s timeout.');
+      }
+      if (badCert) {
         step.log('FYI: OS did not trust the certificate; ignored — '
             'this stage only tests page delivery.');
       }
 
-      final redirNote = resp.redirects.isEmpty
-          ? ''
-          : ' after ${resp.redirects.length} redirect(s)';
-      if (resp.statusCode >= 200 && resp.statusCode < 300) {
+      final redirNote = hops == 0 ? '' : ' after $hops redirect(s)';
+      if (code >= 200 && code < 300) {
         step.status = StepStatus.passed;
-        step.summary = 'Page returned: ${resp.statusCode} '
-            '${resp.reasonPhrase}, $bytes bytes$redirNote.';
-      } else if (resp.statusCode >= 300 && resp.statusCode < 400) {
+        step.summary =
+            'Page returned: $code $reason, $bodyBytes bytes$redirNote.';
+      } else if (code >= 300 && code < 400) {
         step.status = StepStatus.warning;
-        step.summary = 'Server answered with unfollowed redirect '
-            '${resp.statusCode} ${resp.reasonPhrase}.';
+        step.summary =
+            'Server answered with unfollowed redirect $code $reason.';
       } else {
         step.status = StepStatus.failed;
-        step.summary = 'Server answered, but with error '
-            '${resp.statusCode} ${resp.reasonPhrase}$redirNote.';
+        step.summary =
+            'Server answered, but with error $code $reason$redirNote.';
       }
-    } on HandshakeException catch (e) {
-      step.status = StepStatus.failed;
-      step.summary = 'TLS handshake failed — no page returned.';
-      step.log('HandshakeException: ${e.message}');
-    } on SocketException catch (e) {
-      step.status = StepStatus.failed;
-      step.summary = 'Connection failed — no page returned.';
-      step.log('SocketException: ${e.message}');
-    } on TimeoutException {
-      step.status = StepStatus.failed;
-      step.summary =
-          'No response within ${_timeout.inSeconds}s — no page returned.';
-    } on RedirectException catch (e) {
-      step.status = StepStatus.failed;
-      step.summary = 'Redirect loop or too many redirects (>5).';
-      for (final r in e.redirects) {
-        step.log('Redirect ${r.statusCode} → ${r.location}');
-      }
-    } finally {
-      client.close(force: true);
+      return;
     }
+  }
+
+  static int _indexOfDoubleCrlf(List<int> d) {
+    for (var i = 0; i + 3 < d.length; i++) {
+      if (d[i] == 13 && d[i + 1] == 10 && d[i + 2] == 13 && d[i + 3] == 10) {
+        return i;
+      }
+    }
+    return -1;
   }
 
   static String _fmtDate(DateTime d) {
