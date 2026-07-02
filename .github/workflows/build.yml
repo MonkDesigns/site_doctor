@@ -31,7 +31,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev
       - run: flutter create . --platforms=linux --project-name site_doctor
-      - run: flutter build linux --release
+      - run: flutter build linux --release --dart-define=APP_VERSION=${{ github.ref_name }}
       - uses: actions/upload-artifact@v4
         with:
           name: site_doctor-linux-${{ matrix.arch }}
@@ -51,7 +51,7 @@ jobs:
       - run: |
           sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' android/app/src/main/AndroidManifest.xml
           grep -n "INTERNET" android/app/src/main/AndroidManifest.xml
-      - run: flutter build apk --release   # APK bundles arm32+arm64+x64
+      - run: flutter build apk --release --dart-define=APP_VERSION=${{ github.ref_name }}   # APK bundles arm32+arm64+x64
       - uses: actions/upload-artifact@v4
         with:
           name: site_doctor-android-apk
@@ -74,7 +74,7 @@ jobs:
           git clone -q -b stable --depth 1 https://github.com/flutter/flutter.git C:\flutter
           Add-Content $env:GITHUB_PATH "C:\flutter\bin"
       - run: flutter create . --platforms=windows --project-name site_doctor
-      - run: flutter build windows --release
+      - run: flutter build windows --release --dart-define=APP_VERSION=${{ github.ref_name }}
       - uses: actions/upload-artifact@v4
         with:
           name: site_doctor-windows-${{ matrix.arch }}
@@ -92,7 +92,7 @@ jobs:
           for f in macos/Runner/DebugProfile.entitlements macos/Runner/Release.entitlements; do
             /usr/libexec/PlistBuddy -c "Add :com.apple.security.network.client bool true" "$f" || true
           done
-      - run: flutter build macos --release
+      - run: flutter build macos --release --dart-define=APP_VERSION=${{ github.ref_name }}
       # Release .app is a universal binary; print slices to prove it.
       - run: lipo -info build/macos/Build/Products/Release/site_doctor.app/Contents/MacOS/site_doctor
       - uses: actions/upload-artifact@v4
@@ -108,7 +108,7 @@ jobs:
           git clone -q -b stable --depth 1 https://github.com/flutter/flutter.git $HOME/flutter
           echo "$HOME/flutter/bin" >> $GITHUB_PATH
       - run: flutter create . --platforms=ios --project-name site_doctor
-      - run: flutter build ios --release --no-codesign   # signing needed to install on device
+      - run: flutter build ios --release --no-codesign --dart-define=APP_VERSION=${{ github.ref_name }}   # signing needed to install on device
       - uses: actions/upload-artifact@v4
         with:
           name: site_doctor-ios-unsigned

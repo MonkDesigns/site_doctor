@@ -17,6 +17,10 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+// Overridden by CI with the git tag: --dart-define=APP_VERSION=v1.0.2
+const String appVersion =
+    String.fromEnvironment('APP_VERSION', defaultValue: 'v1.0.2-dev');
+
 void main() => runApp(const SiteDoctorApp());
 
 // ---------------------------------------------------------------------------
@@ -445,6 +449,19 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
         title: const Text('Site Doctor',
             style: TextStyle(fontWeight: FontWeight.w600, letterSpacing: 1)),
         centerTitle: false,
+        actions: [
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.only(right: 16),
+              child: Text(appVersion,
+                  style: TextStyle(
+                      fontSize: 13,
+                      fontFamily: 'monospace',
+                      color:
+                          Theme.of(context).colorScheme.onSurfaceVariant)),
+            ),
+          ),
+        ],
       ),
       body: Center(
         child: ConstrainedBox(
