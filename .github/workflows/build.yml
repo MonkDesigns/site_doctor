@@ -1,9 +1,5 @@
-# Site Doctor — CI build for all five targets.
-# Place at .github/workflows/build.yml in the repository.
-#
-# Triggers on every push to main and on any tag starting with "v".
-# Artifacts (downloadable builds) appear on each run's summary page:
-#   repo -> Actions -> click the run -> Artifacts section.
+# Site Doctor — CI build for all targets/architectures.
+# Artifacts: repo -> Actions -> click a run -> Artifacts section.
 
 name: build
 
@@ -11,11 +7,12 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-  workflow_dispatch: {}   # adds a manual "Run workflow" button in the UI
+  workflow_dispatch: {}
 
 jobs:
   linux:
     strategy:
+      fail-fast: false           # one arch failing must not cancel the other
       matrix:
         include:
           - runner: ubuntu-latest       # x64
@@ -25,8 +22,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
-        with: { channel: stable }
+      # Install Flutter from git (arch-agnostic; the tool bootstraps the
+      # right Dart SDK for the host). Prebuilt SDK archives are x64-only.
+      - run: |
+          git clone -q -b stable --depth 1 https://github.com/flutter/flutter.git $HOME/flutter
+          echo "$HOME/flutter/bin" >> $GITHUB_PATH
       - run: |
           sudo apt-get update
           sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev
@@ -43,10 +43,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "21" }
-      - uses: subosito/flutter-action@v2
-        with: { channel: stable }
+      - run: |
+          git clone -q -b stable --depth 1 https://github.com/flutter/flutter.git $HOME/flutter
+          echo "$HOME/flutter/bin" >> $GITHUB_PATH
       - run: flutter create . --platforms=android --project-name site_doctor
-      - run: flutter build apk --release   # debug-keystore signed; fine for sideloading
+      - run: flutter build apk --release   # APK bundles arm32+arm64+x64
       - uses: actions/upload-artifact@v4
         with:
           name: site_doctor-android-apk
@@ -54,17 +55,20 @@ jobs:
 
   windows:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: windows-latest    # x64
             arch: x64
-          - runner: windows-11-arm    # ARM64 (public-preview runner, free on public repos)
+          - runner: windows-11-arm    # ARM64 (public-preview runner)
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
-        with: { channel: stable }
+      - shell: pwsh
+        run: |
+          git clone -q -b stable --depth 1 https://github.com/flutter/flutter.git C:\flutter
+          Add-Content $env:GITHUB_PATH "C:\flutter\bin"
       - run: flutter create . --platforms=windows --project-name site_doctor
       - run: flutter build windows --release
       - uses: actions/upload-artifact@v4
@@ -76,16 +80,16 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
-        with: { channel: stable }
+      - run: |
+          git clone -q -b stable --depth 1 https://github.com/flutter/flutter.git $HOME/flutter
+          echo "$HOME/flutter/bin" >> $GITHUB_PATH
       - run: flutter create . --platforms=macos --project-name site_doctor
-      # Grant outbound-network entitlement (sandbox blocks sockets otherwise).
       - run: |
           for f in macos/Runner/DebugProfile.entitlements macos/Runner/Release.entitlements; do
             /usr/libexec/PlistBuddy -c "Add :com.apple.security.network.client bool true" "$f" || true
           done
       - run: flutter build macos --release
-      # Flutter release .app is a universal binary; print slices to confirm.
+      # Release .app is a universal binary; print slices to prove it.
       - run: lipo -info build/macos/Build/Products/Release/site_doctor.app/Contents/MacOS/site_doctor
       - uses: actions/upload-artifact@v4
         with:
@@ -96,13 +100,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
-        with: { channel: stable }
+      - run: |
+          git clone -q -b stable --depth 1 https://github.com/flutter/flutter.git $HOME/flutter
+          echo "$HOME/flutter/bin" >> $GITHUB_PATH
       - run: flutter create . --platforms=ios --project-name site_doctor
-      # --no-codesign: compiles a full .app but skips Apple signing.
-      # Installing on a device still requires signing with an Apple ID
-      # (free, 7-day sideload) or a $99/yr developer account.
-      - run: flutter build ios --release --no-codesign
+      - run: flutter build ios --release --no-codesign   # signing needed to install on device
       - uses: actions/upload-artifact@v4
         with:
           name: site_doctor-ios-unsigned
