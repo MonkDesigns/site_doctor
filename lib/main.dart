@@ -1,25 +1,30 @@
 // Site Doctor — fine-grained website diagnostics.
 //
-// Runs a staged pipeline against a domain or URL:
-//   1. DNS resolution        (which resource records came back)
-//   2. TCP :80 reachability  (does anything answer on the HTTP port)
-//   3. TCP :443 reachability (does anything answer on the HTTPS port)
-//   4. TLS handshake + cert  (chain validity, subject/issuer, expiration)
-//   5. HTTP GET              (status, redirects, bytes, timing)
-//   6. HTTPS GET             (status, redirects, bytes, timing)
+// Stage 1 resolves the domain via the OS resolver (getaddrinfo) and lists
+// every A/AAAA record. Stages 2-6 then run as N+1 independent suites:
+//
+//   Suite 0:   system-routed — the OS/DNS picks the server, exactly as a
+//              browser would.
+//   Suites 1..N: one per resolved address — the socket is dialed to that
+//              specific server, while SNI and the Host header still carry
+//              the domain name (the curl --resolve technique), so each
+//              server is tested the way a browser would actually use it.
+//
+// Per suite:
+//   2. TCP :80   3. TCP :443   4. TLS cert (presence, name, dates)
+//   5. HTTP GET  6. HTTPS GET
 //
 // Zero external dependencies: dart:io + Flutter only.
-// Targets: Windows, macOS, Linux, Android, iOS.
-// (Not the web target — browsers don't allow raw sockets/DNS.)
+// Targets: Windows, macOS, Linux, Android, iOS (not web: no raw sockets).
 
 import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 
-// Overridden by CI with the git tag: --dart-define=APP_VERSION=v1.0.2
+// Overridden by CI with the git tag: --dart-define=APP_VERSION=v1.1.0
 const String appVersion =
-    String.fromEnvironment('APP_VERSION', defaultValue: 'v1.0.4-dev');
+    String.fromEnvironment('APP_VERSION', defaultValue: 'v1.1.0-dev');
 
 void main() => runApp(const SiteDoctorApp());
 
@@ -40,6 +45,26 @@ class DiagStep {
   void log(String line) => details.add(line);
 }
 
+/// One run of stages 2-6 against a single routing choice.
+/// [targetIp] == null means "let the OS route" (suite 0).
+class TestSuite {
+  TestSuite(this.label, this.targetIp, String hostPathLabel) {
+    httpGet = DiagStep('HTTP GET  http://$hostPathLabel');
+    httpsGet = DiagStep('HTTPS GET  https://$hostPathLabel');
+  }
+
+  final String label;
+  final String? targetIp;
+
+  final DiagStep tcp80 = DiagStep('TCP connect — port 80 (HTTP)');
+  final DiagStep tcp443 = DiagStep('TCP connect — port 443 (HTTPS)');
+  final DiagStep tls = DiagStep('TLS handshake & certificate');
+  late final DiagStep httpGet;
+  late final DiagStep httpsGet;
+
+  List<DiagStep> get steps => [tcp80, tcp443, tls, httpGet, httpsGet];
+}
+
 // ---------------------------------------------------------------------------
 // Diagnostics engine
 // ---------------------------------------------------------------------------
@@ -55,34 +80,44 @@ class Diagnostics {
 
   late final DiagStep dns =
       DiagStep('DNS resolution (OS resolver, getaddrinfo)');
-  late final DiagStep tcp80 = DiagStep('TCP connect — port 80 (HTTP)');
-  late final DiagStep tcp443 = DiagStep('TCP connect — port 443 (HTTPS)');
-  late final DiagStep tls = DiagStep('TLS handshake & certificate');
-  late final DiagStep httpGet = DiagStep('HTTP GET  http://$_hostPathLabel');
-  late final DiagStep httpsGet = DiagStep('HTTPS GET  https://$_hostPathLabel');
+  final List<TestSuite> suites = [];
 
   String get _hostPathLabel =>
       pathAndQuery == '/' ? host : '$host$pathAndQuery';
 
-  List<DiagStep> get steps => [dns, tcp80, tcp443, tls, httpGet, httpsGet];
-
-  bool _dnsOk = false;
-
   Future<void> run() async {
-    await _timed(dns, _testDns);
-    if (!_dnsOk) {
-      for (final s in [tcp80, tcp443, tls, httpGet, httpsGet]) {
-        s.status = StepStatus.skipped;
-        s.summary = 'Skipped — DNS resolution failed, nothing to connect to.';
-      }
-      onUpdate();
-      return;
+    dns.status = StepStatus.running;
+    onUpdate();
+    final sw = Stopwatch()..start();
+    final addrs = await _testDns();
+    dns.elapsed = (sw..stop()).elapsed;
+    onUpdate();
+
+    if (addrs.isEmpty) return; // DNS failed; nothing to route to.
+
+    // Suite 0: OS-routed, then one suite per resolved server.
+    suites.add(TestSuite(
+        'System-routed — OS selects the server (browser behavior)',
+        null,
+        _hostPathLabel));
+    for (final a in addrs) {
+      final fam = a.type == InternetAddressType.IPv6 ? 'IPv6' : 'IPv4';
+      suites.add(TestSuite('Server ${a.address} ($fam)', a.address,
+          _hostPathLabel));
     }
-    await _timed(tcp80, _testTcp80);
-    await _timed(tcp443, _testTcp443);
-    await _timed(tls, _testTls);
-    await _timed(httpGet, () => _testHttpGet(secure: false, step: httpGet));
-    await _timed(httpsGet, () => _testHttpGet(secure: true, step: httpsGet));
+    onUpdate();
+
+    for (final suite in suites) {
+      await _runSuite(suite);
+    }
+  }
+
+  Future<void> _runSuite(TestSuite s) async {
+    await _timed(s.tcp80, () => _testTcpPort(s, s.tcp80, 80));
+    await _timed(s.tcp443, () => _testTcpPort(s, s.tcp443, 443));
+    await _timed(s.tls, () => _testTls(s));
+    await _timed(s.httpGet, () => _testHttpGet(s, secure: false));
+    await _timed(s.httpsGet, () => _testHttpGet(s, secure: true));
   }
 
   Future<void> _timed(DiagStep step, Future<void> Function() body) async {
@@ -103,20 +138,17 @@ class Diagnostics {
   // -- 1. DNS ---------------------------------------------------------------
   //
   // InternetAddress.lookup() is Dart's wrapper around the platform's
-  // getaddrinfo() — i.e. the OS host() resolution path. It queries the
-  // system-configured resolver (stub -> recursive -> root/TLD/authoritative
-  // hierarchy). Nothing here ever contacts the target web server; this stage
-  // purely verifies that resource records exist for the name in public DNS
-  // as seen from this machine.
+  // getaddrinfo() — the OS host() resolution path (stub -> recursive ->
+  // root/TLD/authoritative). The target web server is never contacted;
+  // this stage purely verifies resource records exist for the name.
 
-  Future<void> _testDns() async {
+  Future<List<InternetAddress>> _testDns() async {
     try {
-      final addrs =
-          await InternetAddress.lookup(host).timeout(_timeout);
+      final addrs = await InternetAddress.lookup(host).timeout(_timeout);
       if (addrs.isEmpty) {
         dns.status = StepStatus.failed;
         dns.summary = 'Lookup returned no resource records for "$host".';
-        return;
+        return [];
       }
       dns.log('Resolved via system resolver (getaddrinfo), '
           'not the target server.');
@@ -129,9 +161,9 @@ class Diagnostics {
         dns.log('AAAA  ${a.address}');
       }
       dns.status = StepStatus.passed;
-      dns.summary =
-          '${addrs.length} record(s): ${v4.length} A, ${v6.length} AAAA.';
-      _dnsOk = true;
+      dns.summary = '${addrs.length} record(s): ${v4.length} A, '
+          '${v6.length} AAAA — ${addrs.length} server(s) to test.';
+      return addrs;
     } on SocketException catch (e) {
       dns.status = StepStatus.failed;
       dns.summary = 'No resource records — lookup failed.';
@@ -141,14 +173,15 @@ class Diagnostics {
       dns.status = StepStatus.failed;
       dns.summary = 'Lookup timed out after ${_timeout.inSeconds}s.';
     }
+    return [];
   }
 
   // -- 2 & 3. Raw TCP reachability -------------------------------------------
 
-  Future<void> _testTcpPort(DiagStep step, int port) async {
+  Future<void> _testTcpPort(TestSuite s, DiagStep step, int port) async {
+    final dialTo = s.targetIp ?? host;
     try {
-      final socket =
-          await Socket.connect(host, port, timeout: _timeout);
+      final socket = await Socket.connect(dialTo, port, timeout: _timeout);
       step.log('Connected to ${socket.remoteAddress.address}:'
           '${socket.remotePort} (local port ${socket.port})');
       socket.destroy();
@@ -166,30 +199,42 @@ class Diagnostics {
     }
   }
 
-  Future<void> _testTcp80() => _testTcpPort(tcp80, 80);
-  Future<void> _testTcp443() => _testTcpPort(tcp443, 443);
+  // -- 4. TLS certificate ----------------------------------------------------
+  //
+  // Verifies exactly three things:
+  //   (a) a certificate is presented,
+  //   (b) it covers the host name being tested (SAN list, CN fallback),
+  //   (c) it is date-valid right now.
+  // Chain / CA trust is deliberately NOT evaluated.
+  //
+  // When targeting a specific server, the raw socket is dialed to that IP
+  // and then upgraded to TLS with SNI = the domain name, so a virtual-host
+  // server presents the same certificate a browser would receive from it.
 
-  // -- 4. TLS handshake & certificate ----------------------------------------
-
-  Future<void> _testTls() async {
-    if (tcp443.status == StepStatus.failed) {
-      tls.status = StepStatus.skipped;
-      tls.summary = 'Skipped — port 443 is not reachable.';
+  Future<void> _testTls(TestSuite s) async {
+    if (s.tcp443.status == StepStatus.failed) {
+      s.tls.status = StepStatus.skipped;
+      s.tls.summary = 'Skipped — port 443 is not reachable.';
       return;
     }
+    final tls = s.tls;
 
-    // Per design: this stage verifies exactly three things —
-    //   (a) a certificate is presented,
-    //   (b) it covers the host name being tested (SAN list, CN fallback),
-    //   (c) it is date-valid right now.
-    // Chain / CA trust is deliberately NOT evaluated; that judgement is
-    // left to the operator.
     X509Certificate? cert;
     try {
-      final s = await SecureSocket.connect(host, 443,
-          timeout: _timeout, onBadCertificate: (_) => true);
-      cert = s.peerCertificate;
-      s.destroy();
+      final SecureSocket ss;
+      if (s.targetIp == null) {
+        ss = await SecureSocket.connect(host, 443,
+            timeout: _timeout, onBadCertificate: (_) => true);
+      } else {
+        final raw =
+            await Socket.connect(s.targetIp!, 443, timeout: _timeout);
+        ss = await SecureSocket.secure(raw,
+                host: host, onBadCertificate: (_) => true)
+            .timeout(_timeout);
+        tls.log('Dialed ${s.targetIp}; SNI sent as "$host".');
+      }
+      cert = ss.peerCertificate;
+      ss.destroy();
     } on SocketException catch (e) {
       tls.status = StepStatus.failed;
       tls.summary = 'Could not open a TLS connection.';
@@ -212,7 +257,6 @@ class Diagnostics {
       return;
     }
 
-    // Gather the names the certificate covers.
     final sans = _extractDnsNames(cert.der);
     final cn =
         RegExp(r'CN=([^,/]+)').firstMatch(cert.subject)?.group(1)?.trim();
@@ -227,7 +271,8 @@ class Diagnostics {
 
     tls.log('Subject : ${cert.subject}');
     tls.log('Issuer  : ${cert.issuer}');
-    tls.log('Names covered : ${names.isEmpty ? '(none found)' : names.join(', ')}');
+    tls.log('Names covered : '
+        '${names.isEmpty ? '(none found)' : names.join(', ')}');
     tls.log('Valid from : ${_fmtDate(notBefore)}');
     tls.log('Expires    : $expiry');
     tls.log('Chain/CA trust intentionally not checked.');
@@ -267,7 +312,6 @@ class Diagnostics {
   /// Minimal DER walk: pull dNSName entries out of the subjectAltName
   /// extension (OID 2.5.29.17). No ASN.1 library — just enough parsing.
   static List<String> _extractDnsNames(List<int> der) {
-    // DER length field: (value, bytesUsed) starting at index i.
     (int, int) len(int i) {
       final first = der[i];
       if (first < 0x80) return (first, 1);
@@ -281,15 +325,13 @@ class Diagnostics {
 
     final names = <String>[];
     for (var i = 0; i + 4 < der.length; i++) {
-      // OID 2.5.29.17 == 06 03 55 1D 11
       if (der[i] != 0x06 || der[i + 1] != 0x03 || der[i + 2] != 0x55 ||
           der[i + 3] != 0x1D || der[i + 4] != 0x11) continue;
       var j = i + 5;
-      // Optional BOOLEAN "critical" flag: 01 01 xx
       if (j + 2 < der.length && der[j] == 0x01 && der[j + 1] == 0x01) j += 3;
       if (j >= der.length || der[j] != 0x04) continue; // OCTET STRING
       final (_, oh) = len(j + 1);
-      var k = j + 1 + oh;
+      final k = j + 1 + oh;
       if (k >= der.length || der[k] != 0x30) continue; // SEQUENCE
       final (slen, sh) = len(k + 1);
       var p = k + 1 + sh;
@@ -300,7 +342,6 @@ class Diagnostics {
         final v = p + 1 + h;
         if (v + l > der.length) break;
         if (tag == 0x82) {
-          // dNSName — IA5String, plain ASCII
           names.add(String.fromCharCodes(der.sublist(v, v + l)));
         }
         p = v + l;
@@ -311,33 +352,46 @@ class Diagnostics {
   }
 
   // -- 5 & 6. Full HTTP / HTTPS GET -------------------------------------------
+  //
+  // When targeting a specific server, the connection is dialed to that IP
+  // while the request URI keeps the domain name — so SNI, certificate
+  // matching, the Host header, and redirects all behave exactly as a
+  // browser reaching that particular server (curl --resolve equivalent).
 
-  Future<void> _testHttpGet(
-      {required bool secure, required DiagStep step}) async {
-    final dependency = secure ? tcp443 : tcp80;
+  Future<void> _testHttpGet(TestSuite s, {required bool secure}) async {
+    final step = secure ? s.httpsGet : s.httpGet;
+    final dependency = secure ? s.tcp443 : s.tcp80;
     if (dependency.status == StepStatus.failed) {
       step.status = StepStatus.skipped;
-      step.summary =
-          'Skipped — port ${secure ? 443 : 80} is not reachable.';
+      step.summary = 'Skipped — port ${secure ? 443 : 80} is not reachable.';
       return;
     }
 
     final client = HttpClient()
       ..connectionTimeout = _timeout
-      ..userAgent = 'SiteDoctor/1.0';
+      ..userAgent = 'SiteDoctor/1.1';
     bool badCertAccepted = false;
     client.badCertificateCallback = (c, h, p) {
-      badCertAccepted = true; // let the request proceed, but report it
+      badCertAccepted = true;
       return true;
     };
+    if (s.targetIp != null) {
+      final ip = s.targetIp!;
+      client.connectionFactory = (uri, proxyHost, proxyPort) {
+        // Dial the chosen server regardless of what the URI's host
+        // resolves to. TLS (with SNI = uri.host) is layered on top by
+        // HttpClient for https URIs.
+        return Socket.startConnect(ip, uri.port);
+      };
+      step.log('Connections pinned to ${s.targetIp}.');
+    }
 
+    final parsed = Uri.parse('http://x$pathAndQuery');
     final uri = Uri(
       scheme: secure ? 'https' : 'http',
       host: host,
-      path: Uri.parse('http://x$pathAndQuery').path,
-      query: Uri.parse('http://x$pathAndQuery').query.isEmpty
-          ? null
-          : Uri.parse('http://x$pathAndQuery').query,
+      path: parsed.path,
+      query: parsed.query.isEmpty ? null : parsed.query,
     );
 
     try {
@@ -421,13 +475,13 @@ class SiteDoctorApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const seed = Color(0xFF1E6E5C); // desaturated spruce green
+    const seed = Color(0xFF1E6E5C);
     return MaterialApp(
       title: 'Site Doctor',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-            seedColor: seed, brightness: Brightness.dark),
+        colorScheme:
+            ColorScheme.fromSeed(seedColor: seed, brightness: Brightness.dark),
         useMaterial3: true,
         scaffoldBackgroundColor: const Color(0xFF15201D),
       ),
@@ -478,9 +532,8 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
       _inputError = null;
       _running = true;
       _diag = diag;
-      _targetLabel = pathAndQuery == '/'
-          ? uri.host
-          : '${uri.host}$pathAndQuery';
+      _targetLabel =
+          pathAndQuery == '/' ? uri.host : '${uri.host}$pathAndQuery';
     });
 
     await diag.run();
@@ -489,7 +542,20 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
 
   @override
   Widget build(BuildContext context) {
-    final steps = _diag?.steps ?? const <DiagStep>[];
+    final diag = _diag;
+    // Flatten DNS + suites into one scrollable list of rows.
+    final rows = <Widget>[];
+    if (diag != null) {
+      rows.add(_StepCard(step: diag.dns, index: 1));
+      for (final s in diag.suites) {
+        rows.add(_SuiteHeader(label: s.label));
+        var n = 2;
+        for (final step in s.steps) {
+          rows.add(_StepCard(step: step, index: n++));
+        }
+      }
+    }
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Site Doctor',
@@ -503,8 +569,7 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
                   style: TextStyle(
                       fontSize: 13,
                       fontFamily: 'monospace',
-                      color:
-                          Theme.of(context).colorScheme.onSurfaceVariant)),
+                      color: Theme.of(context).colorScheme.onSurfaceVariant)),
             ),
           ),
         ],
@@ -561,11 +626,12 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
                             fontFamily: 'monospace')),
                   ),
                 Expanded(
-                  child: steps.isEmpty
+                  child: rows.isEmpty
                       ? Center(
                           child: Text(
-                            'Enter a domain to run the six-stage checkup:\n'
-                            'DNS → TCP 80 → TCP 443 → certificate → '
+                            'Enter a domain to run the checkup:\n'
+                            'DNS, then per-server suites of\n'
+                            'TCP 80 → TCP 443 → certificate → '
                             'HTTP GET → HTTPS GET',
                             textAlign: TextAlign.center,
                             style: TextStyle(
@@ -574,16 +640,38 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
                                     .onSurfaceVariant),
                           ),
                         )
-                      : ListView.builder(
-                          itemCount: steps.length,
-                          itemBuilder: (context, i) =>
-                              _StepCard(step: steps[i], index: i + 1),
-                        ),
+                      : ListView(children: rows),
                 ),
               ],
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _SuiteHeader extends StatelessWidget {
+  const _SuiteHeader({required this.label});
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 18, 4, 6),
+      child: Row(
+        children: [
+          Icon(Icons.dns_outlined, size: 18, color: cs.primary),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(label,
+                style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.3,
+                    color: cs.primary)),
+          ),
+        ],
       ),
     );
   }
@@ -615,9 +703,8 @@ class _StepCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final (icon, color) = _iconFor(context);
-    final elapsed = step.elapsed == null
-        ? null
-        : '${step.elapsed!.inMilliseconds} ms';
+    final elapsed =
+        step.elapsed == null ? null : '${step.elapsed!.inMilliseconds} ms';
 
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 4),
@@ -625,14 +712,12 @@ class _StepCard extends StatelessWidget {
           ? ListTile(
               leading: Icon(icon, color: color),
               title: Text('$index. ${step.title}'),
-              subtitle:
-                  step.summary.isEmpty ? null : Text(step.summary),
+              subtitle: step.summary.isEmpty ? null : Text(step.summary),
               trailing: elapsed == null
                   ? null
                   : Text(elapsed,
                       style: TextStyle(
-                          color:
-                              Theme.of(context).colorScheme.outline)),
+                          color: Theme.of(context).colorScheme.outline)),
             )
           : ExpansionTile(
               leading: Icon(icon, color: color),
@@ -642,10 +727,8 @@ class _StepCard extends StatelessWidget {
                   ? null
                   : Text(elapsed,
                       style: TextStyle(
-                          color:
-                              Theme.of(context).colorScheme.outline)),
-              childrenPadding:
-                  const EdgeInsets.fromLTRB(24, 0, 16, 12),
+                          color: Theme.of(context).colorScheme.outline)),
+              childrenPadding: const EdgeInsets.fromLTRB(24, 0, 16, 12),
               expandedCrossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 for (final line in step.details)
