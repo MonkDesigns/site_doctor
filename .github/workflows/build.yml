@@ -15,7 +15,14 @@ on:
 
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest       # x64
+            arch: x64
+          - runner: ubuntu-24.04-arm    # ARM64 (free on public repos)
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
@@ -27,8 +34,8 @@ jobs:
       - run: flutter build linux --release
       - uses: actions/upload-artifact@v4
         with:
-          name: site_doctor-linux-x64
-          path: build/linux/x64/release/bundle/
+          name: site_doctor-linux-${{ matrix.arch }}
+          path: build/linux/${{ matrix.arch }}/release/bundle/
 
   android:
     runs-on: ubuntu-latest
@@ -46,7 +53,14 @@ jobs:
           path: build/app/outputs/flutter-apk/app-release.apk
 
   windows:
-    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - runner: windows-latest    # x64
+            arch: x64
+          - runner: windows-11-arm    # ARM64 (public-preview runner, free on public repos)
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
@@ -55,8 +69,8 @@ jobs:
       - run: flutter build windows --release
       - uses: actions/upload-artifact@v4
         with:
-          name: site_doctor-windows-x64
-          path: build/windows/x64/runner/Release/
+          name: site_doctor-windows-${{ matrix.arch }}
+          path: build/windows/${{ matrix.arch }}/runner/Release/
 
   macos:
     runs-on: macos-latest
@@ -71,9 +85,11 @@ jobs:
             /usr/libexec/PlistBuddy -c "Add :com.apple.security.network.client bool true" "$f" || true
           done
       - run: flutter build macos --release
+      # Flutter release .app is a universal binary; print slices to confirm.
+      - run: lipo -info build/macos/Build/Products/Release/site_doctor.app/Contents/MacOS/site_doctor
       - uses: actions/upload-artifact@v4
         with:
-          name: site_doctor-macos
+          name: site_doctor-macos-universal
           path: build/macos/Build/Products/Release/site_doctor.app
 
   ios:
