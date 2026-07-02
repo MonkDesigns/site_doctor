@@ -19,7 +19,7 @@ import 'package:flutter/material.dart';
 
 // Overridden by CI with the git tag: --dart-define=APP_VERSION=v1.0.2
 const String appVersion =
-    String.fromEnvironment('APP_VERSION', defaultValue: 'v1.0.2-dev');
+    String.fromEnvironment('APP_VERSION', defaultValue: 'v1.0.3-dev');
 
 void main() => runApp(const SiteDoctorApp());
 
@@ -314,19 +314,17 @@ class Diagnostics {
       if (ctype != null) step.log('Content-Type : $ctype');
       step.log('Body : $bytes bytes received');
       if (badCertAccepted) {
-        step.log('NOTE: TLS certificate failed validation; '
-            'request forced through for diagnostics.');
+        step.log('FYI: certificate did not validate (see stage 4); '
+            'ignored here — this stage only tests page delivery.');
       }
 
       final redirNote = resp.redirects.isEmpty
           ? ''
           : ' after ${resp.redirects.length} redirect(s)';
       if (resp.statusCode >= 200 && resp.statusCode < 300) {
-        step.status =
-            badCertAccepted ? StepStatus.warning : StepStatus.passed;
+        step.status = StepStatus.passed;
         step.summary = 'Page returned: ${resp.statusCode} '
-            '${resp.reasonPhrase}, $bytes bytes$redirNote'
-            '${badCertAccepted ? ' (bad certificate!)' : ''}.';
+            '${resp.reasonPhrase}, $bytes bytes$redirNote.';
       } else if (resp.statusCode >= 300 && resp.statusCode < 400) {
         step.status = StepStatus.warning;
         step.summary = 'Server answered with unfollowed redirect '
