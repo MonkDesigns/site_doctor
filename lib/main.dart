@@ -19,7 +19,7 @@ import 'package:flutter/material.dart';
 
 // Overridden by CI with the git tag: --dart-define=APP_VERSION=v1.0.2
 const String appVersion =
-    String.fromEnvironment('APP_VERSION', defaultValue: 'v1.0.3-dev');
+    String.fromEnvironment('APP_VERSION', defaultValue: 'v1.0.4-dev');
 
 void main() => runApp(const SiteDoctorApp());
 
@@ -178,46 +178,32 @@ class Diagnostics {
       return;
     }
 
+    // Per design: this stage verifies exactly three things —
+    //   (a) a certificate is presented,
+    //   (b) it covers the host name being tested (SAN list, CN fallback),
+    //   (c) it is date-valid right now.
+    // Chain / CA trust is deliberately NOT evaluated; that judgement is
+    // left to the operator.
     X509Certificate? cert;
-    bool strictOk = false;
-    String? strictError;
-
-    // First pass: strict validation, the way a browser would see it.
     try {
-      final s = await SecureSocket.connect(host, 443, timeout: _timeout);
+      final s = await SecureSocket.connect(host, 443,
+          timeout: _timeout, onBadCertificate: (_) => true);
       cert = s.peerCertificate;
-      strictOk = true;
       s.destroy();
-    } on HandshakeException catch (e) {
-      strictError = e.message;
-    } on TlsException catch (e) {
-      strictError = e.message;
     } on SocketException catch (e) {
       tls.status = StepStatus.failed;
       tls.summary = 'Could not open a TLS connection.';
       tls.log('SocketException: ${e.message}');
       return;
+    } on HandshakeException catch (e) {
+      tls.status = StepStatus.failed;
+      tls.summary = 'TLS handshake failed — no certificate retrievable.';
+      tls.log('HandshakeException: ${e.message}');
+      return;
     } on TimeoutException {
       tls.status = StepStatus.failed;
       tls.summary = 'TLS handshake timed out after ${_timeout.inSeconds}s.';
       return;
-    }
-
-    // Second pass (only if strict failed): fetch the cert anyway so we can
-    // still report subject/issuer/expiry for debugging.
-    if (!strictOk) {
-      try {
-        final s = await SecureSocket.connect(host, 443,
-            timeout: _timeout, onBadCertificate: (_) => true);
-        cert = s.peerCertificate;
-        s.destroy();
-      } catch (e) {
-        tls.status = StepStatus.failed;
-        tls.summary = 'TLS handshake failed; certificate not retrievable.';
-        tls.log('Strict handshake error: $strictError');
-        tls.log('Permissive retry error: $e');
-        return;
-      }
     }
 
     if (cert == null) {
@@ -226,40 +212,102 @@ class Diagnostics {
       return;
     }
 
+    // Gather the names the certificate covers.
+    final sans = _extractDnsNames(cert.der);
+    final cn =
+        RegExp(r'CN=([^,/]+)').firstMatch(cert.subject)?.group(1)?.trim();
+    final names = <String>{...sans, if (cn != null && cn.isNotEmpty) cn};
+    final nameOk = names.any((n) => _nameMatches(host, n));
+
     final now = DateTime.now();
     final notBefore = cert.startValidity.toLocal();
     final notAfter = cert.endValidity.toLocal();
     final remaining = cert.endValidity.difference(now);
+    final expiry = _fmtDate(notAfter);
 
     tls.log('Subject : ${cert.subject}');
     tls.log('Issuer  : ${cert.issuer}');
+    tls.log('Names covered : ${names.isEmpty ? '(none found)' : names.join(', ')}');
     tls.log('Valid from : ${_fmtDate(notBefore)}');
-    tls.log('Expires    : ${_fmtDate(notAfter)}');
-    if (!strictOk) tls.log('Chain validation error: $strictError');
+    tls.log('Expires    : $expiry');
+    tls.log('Chain/CA trust intentionally not checked.');
 
-    final expiry = _fmtDate(notAfter);
-    if (remaining.isNegative) {
+    if (!nameOk) {
+      tls.status = StepStatus.failed;
+      tls.summary = 'Certificate does not cover "$host" '
+          '(covers: ${names.isEmpty ? 'no names' : names.join(', ')}).';
+    } else if (cert.startValidity.isAfter(now)) {
+      tls.status = StepStatus.failed;
+      tls.summary =
+          'Certificate not yet valid (starts ${_fmtDate(notBefore)}).';
+    } else if (remaining.isNegative) {
       tls.status = StepStatus.failed;
       tls.summary =
           'Certificate EXPIRED ${-remaining.inDays} day(s) ago ($expiry).';
-    } else if (!strictOk) {
-      tls.status = StepStatus.failed;
-      tls.summary =
-          'Certificate presented but failed validation (expires $expiry).';
-    } else if (cert.startValidity.isAfter(now)) {
-      tls.status = StepStatus.warning;
-      tls.summary = 'Certificate is not yet valid (starts '
-          '${_fmtDate(notBefore)}).';
-    } else if (remaining.inDays < 30) {
-      tls.status = StepStatus.warning;
-      tls.summary =
-          'Certificate valid but expires in ${remaining.inDays} day(s): '
-          '$expiry.';
     } else {
       tls.status = StepStatus.passed;
-      tls.summary =
-          'Certificate valid. Expires $expiry (${remaining.inDays} days left).';
+      tls.summary = 'Name matches; date-valid. Expires $expiry '
+          '(${remaining.inDays} days left).';
     }
+  }
+
+  /// True if [host] is covered by certificate name [pattern]
+  /// (exact match, or single-label wildcard like *.example.com).
+  static bool _nameMatches(String host, String pattern) {
+    host = host.toLowerCase();
+    pattern = pattern.toLowerCase();
+    if (pattern == host) return true;
+    if (pattern.startsWith('*.')) {
+      final dot = host.indexOf('.');
+      return dot > 0 && host.substring(dot + 1) == pattern.substring(2);
+    }
+    return false;
+  }
+
+  /// Minimal DER walk: pull dNSName entries out of the subjectAltName
+  /// extension (OID 2.5.29.17). No ASN.1 library — just enough parsing.
+  static List<String> _extractDnsNames(List<int> der) {
+    // DER length field: (value, bytesUsed) starting at index i.
+    (int, int) len(int i) {
+      final first = der[i];
+      if (first < 0x80) return (first, 1);
+      final n = first & 0x7F;
+      var v = 0;
+      for (var k = 0; k < n && i + 1 + k < der.length; k++) {
+        v = (v << 8) | der[i + 1 + k];
+      }
+      return (v, 1 + n);
+    }
+
+    final names = <String>[];
+    for (var i = 0; i + 4 < der.length; i++) {
+      // OID 2.5.29.17 == 06 03 55 1D 11
+      if (der[i] != 0x06 || der[i + 1] != 0x03 || der[i + 2] != 0x55 ||
+          der[i + 3] != 0x1D || der[i + 4] != 0x11) continue;
+      var j = i + 5;
+      // Optional BOOLEAN "critical" flag: 01 01 xx
+      if (j + 2 < der.length && der[j] == 0x01 && der[j + 1] == 0x01) j += 3;
+      if (j >= der.length || der[j] != 0x04) continue; // OCTET STRING
+      final (_, oh) = len(j + 1);
+      var k = j + 1 + oh;
+      if (k >= der.length || der[k] != 0x30) continue; // SEQUENCE
+      final (slen, sh) = len(k + 1);
+      var p = k + 1 + sh;
+      final end = p + slen;
+      while (p < end && p + 1 < der.length) {
+        final tag = der[p];
+        final (l, h) = len(p + 1);
+        final v = p + 1 + h;
+        if (v + l > der.length) break;
+        if (tag == 0x82) {
+          // dNSName — IA5String, plain ASCII
+          names.add(String.fromCharCodes(der.sublist(v, v + l)));
+        }
+        p = v + l;
+      }
+      if (names.isNotEmpty) break;
+    }
+    return names;
   }
 
   // -- 5 & 6. Full HTTP / HTTPS GET -------------------------------------------
@@ -314,8 +362,8 @@ class Diagnostics {
       if (ctype != null) step.log('Content-Type : $ctype');
       step.log('Body : $bytes bytes received');
       if (badCertAccepted) {
-        step.log('FYI: certificate did not validate (see stage 4); '
-            'ignored here — this stage only tests page delivery.');
+        step.log('FYI: OS did not trust the certificate; ignored — '
+            'this stage only tests page delivery.');
       }
 
       final redirNote = resp.redirects.isEmpty
