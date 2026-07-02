@@ -101,8 +101,7 @@ class Diagnostics {
         null,
         _hostPathLabel));
     for (final a in addrs) {
-      final fam = a.type == InternetAddressType.IPv6 ? 'IPv6' : 'IPv4';
-      suites.add(TestSuite('Server ${a.address} ($fam)', a.address,
+      suites.add(TestSuite('Server ${a.address}', a.address,
           _hostPathLabel));
     }
     onUpdate();
@@ -144,26 +143,34 @@ class Diagnostics {
 
   Future<List<InternetAddress>> _testDns() async {
     try {
-      final addrs = await InternetAddress.lookup(host).timeout(_timeout);
-      if (addrs.isEmpty) {
-        dns.status = StepStatus.failed;
-        dns.summary = 'Lookup returned no resource records for "$host".';
-        return [];
-      }
+      final all = await InternetAddress.lookup(host).timeout(_timeout);
+      final v4 = all
+          .where((a) => a.type == InternetAddressType.IPv4)
+          .toList();
+      final v6n = all
+          .where((a) => a.type == InternetAddressType.IPv6)
+          .length;
       dns.log('Resolved via system resolver (getaddrinfo), '
           'not the target server.');
-      final v4 = addrs.where((a) => a.type == InternetAddressType.IPv4);
-      final v6 = addrs.where((a) => a.type == InternetAddressType.IPv6);
       for (final a in v4) {
         dns.log('A     ${a.address}');
       }
-      for (final a in v6) {
-        dns.log('AAAA  ${a.address}');
+      if (v6n > 0) {
+        dns.log('($v6n AAAA record(s) present — IPv6 not tested '
+            'in this version.)');
+      }
+      if (v4.isEmpty) {
+        dns.status = StepStatus.failed;
+        dns.summary = all.isEmpty
+            ? 'Lookup returned no resource records for "$host".'
+            : 'No A (IPv4) records for "$host" '
+                '(only $v6n AAAA — IPv6 not supported yet).';
+        return [];
       }
       dns.status = StepStatus.passed;
-      dns.summary = '${addrs.length} record(s): ${v4.length} A, '
-          '${v6.length} AAAA — ${addrs.length} server(s) to test.';
-      return addrs;
+      dns.summary =
+          '${v4.length} A record(s) — ${v4.length} server(s) to test.';
+      return v4;
     } on SocketException catch (e) {
       dns.status = StepStatus.failed;
       dns.summary = 'No resource records — lookup failed.';
